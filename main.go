@@ -1,47 +1,134 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/bwmarrin/discordgo"
-	"google.golang.org/genai"
 )
 
 const (
-	defaultModel     = "gemini-3.8-flash"
+	defaultModel     = "openai"
+	defaultEndpoint  = "https://text.pollinations.ai/openai"
 	discordMaxMsgLen = 2000
 )
 
+type pollinationsClient struct {
+	apiKey     string
+	endpoint   string
+	model      string
+	httpClient *http.Client
+}
+
+type chatCompletionRequest struct {
+	Model    string        `json:"model"`
+	Messages []chatMessage `json:"messages"`
+}
+
+type chatMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+type chatCompletionResponse struct {
+	Choices []struct {
+		Message chatMessage `json:"message"`
+	} `json:"choices"`
+	Error *struct {
+		Message string `json:"message"`
+		Type    string `json:"type"`
+	} `json:"error,omitempty"`
+}
+
+func (c *pollinationsClient) generateReply(ctx context.Context, prompt string) (string, error) {
+	reqBody, err := json.Marshal(chatCompletionRequest{
+		Model: c.model,
+		Messages: []chatMessage{
+			{Role: "user", Content: prompt},
+		},
+	})
+	if err != nil {
+		return "", fmt.Errorf("marshaling request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint, bytes.NewReader(reqBody))
+	if err != nil {
+		return "", fmt.Errorf("creating request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if c.apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("sending request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("reading response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(bodyBytes)))
+	}
+
+	var completion chatCompletionResponse
+	if err := json.Unmarshal(bodyBytes, &completion); err == nil {
+		if completion.Error != nil {
+			return "", fmt.Errorf("API error (%s): %s", completion.Error.Type, completion.Error.Message)
+		}
+		if len(completion.Choices) > 0 {
+			return completion.Choices[0].Message.Content, nil
+		}
+	}
+
+	// Fallback if Pollinations returns plain text directly
+	plainText := strings.TrimSpace(string(bodyBytes))
+	if plainText == "" {
+		return "", fmt.Errorf("empty response from Pollinations")
+	}
+	return plainText, nil
+}
+
 func main() {
 	discordToken := strings.TrimSpace(os.Getenv("KLAUS_DISCORD_BOT_TOKEN"))
-	geminiAPIKey := strings.TrimSpace(os.Getenv("KLAUS_GEMINI_API_KEY"))
-	modelName := strings.TrimSpace(os.Getenv("KLAUS_GEMINI_MODEL"))
+	pollinationsAPIKey := strings.TrimSpace(os.Getenv("KLAUS_POLLINATIONS_API_KEY"))
+	modelName := strings.TrimSpace(os.Getenv("KLAUS_POLLINATIONS_MODEL"))
 	if modelName == "" {
 		modelName = defaultModel
+	}
+	endpoint := strings.TrimSpace(os.Getenv("KLAUS_POLLINATIONS_URL"))
+	if endpoint == "" {
+		endpoint = defaultEndpoint
 	}
 
 	if discordToken == "" {
 		log.Fatal("Environment variable KLAUS_DISCORD_BOT_TOKEN is missing!")
 	}
-	if geminiAPIKey == "" {
-		log.Fatal("Environment variable KLAUS_GEMINI_API_KEY is missing!")
-	}
 
 	ctx := context.Background()
 
-	// Initialize gemini client
-	geminiClient, err := genai.NewClient(ctx, &genai.ClientConfig{
-		APIKey:  geminiAPIKey,
-		Backend: genai.BackendGeminiAPI,
-	})
-	if err != nil {
-		log.Fatalf("Error initializing Gemini client: %v", err)
+	// Initialize Pollinations client
+	aiClient := &pollinationsClient{
+		apiKey:   pollinationsAPIKey,
+		endpoint: endpoint,
+		model:    modelName,
+		httpClient: &http.Client{
+			Timeout: 60 * time.Second,
+		},
 	}
 
 	// Create discord session
@@ -57,7 +144,7 @@ func main() {
 
 	// Event handler for triggering with every new message
 	dg.AddHandler(func(s *discordgo.Session, m *discordgo.MessageCreate) {
-		handleMessage(ctx, s, m, geminiClient, modelName)
+		handleMessage(ctx, s, m, aiClient)
 	})
 
 	// Open websocket to discord
@@ -80,8 +167,7 @@ func handleMessage(
 	ctx context.Context,
 	s *discordgo.Session,
 	m *discordgo.MessageCreate,
-	geminiClient *genai.Client,
-	modelName string,
+	aiClient *pollinationsClient,
 ) {
 	// Ignore own messages
 	if s.State.User == nil || m.Author.ID == s.State.User.ID {
@@ -103,15 +189,15 @@ func handleMessage(
 	// Show "Klaus is typing..." while thinking
 	_ = s.ChannelTyping(m.ChannelID)
 
-	// Send request to Gemini API
-	resp, err := geminiClient.Models.GenerateContent(ctx, modelName, genai.Text(prompt), nil)
+	// Send request to Pollinations API
+	respText, err := aiClient.generateReply(ctx, prompt)
 	if err != nil {
-		log.Printf("Gemini-Fehler: %v", err)
+		log.Printf("Pollinations-Fehler: %v", err)
 		_, _ = s.ChannelMessageSendReply(m.ChannelID, "kein plan", m.Reference())
 		return
 	}
 
-	replyText := strings.TrimSpace(resp.Text())
+	replyText := strings.TrimSpace(respText)
 	if replyText == "" {
 		replyText = ""
 	}
