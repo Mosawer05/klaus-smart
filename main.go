@@ -18,16 +18,22 @@ import (
 )
 
 const (
-	defaultModel     = "openai"
-	defaultEndpoint  = "https://text.pollinations.ai/openai"
-	discordMaxMsgLen = 2000
+	defaultModel        = "openai"
+	defaultEndpoint     = "https://text.pollinations.ai/openai"
+	discordMaxMsgLen    = 2000
+	contextMessageCount = 10
+	defaultSystemPrompt = "You are Klaus, a regular user on this Discord server and not a formal AI assistant. " +
+		"Keep your replies extremely short, dry, and casual in a typical Discord chat style (usually just a few words or at most 1-2 short sentences, lowercase is fine). " +
+		"Never write long paragraphs, bulleted lists, or generic AI filler phrases. " +
+		"Naturally match the language, tone, and topic of the ongoing conversation."
 )
 
 type pollinationsClient struct {
-	apiKey     string
-	endpoint   string
-	model      string
-	httpClient *http.Client
+	apiKey       string
+	endpoint     string
+	model        string
+	systemPrompt string
+	httpClient   *http.Client
 }
 
 type chatCompletionRequest struct {
@@ -50,12 +56,19 @@ type chatCompletionResponse struct {
 	} `json:"error,omitempty"`
 }
 
-func (c *pollinationsClient) generateReply(ctx context.Context, prompt string) (string, error) {
+func (c *pollinationsClient) generateReply(ctx context.Context, history []chatMessage) (string, error) {
+	messages := make([]chatMessage, 0, len(history)+1)
+	if c.systemPrompt != "" {
+		messages = append(messages, chatMessage{
+			Role:    "system",
+			Content: c.systemPrompt,
+		})
+	}
+	messages = append(messages, history...)
+
 	reqBody, err := json.Marshal(chatCompletionRequest{
-		Model: c.model,
-		Messages: []chatMessage{
-			{Role: "user", Content: prompt},
-		},
+		Model:    c.model,
+		Messages: messages,
 	})
 	if err != nil {
 		return "", fmt.Errorf("marshaling request: %w", err)
@@ -114,6 +127,10 @@ func main() {
 	if endpoint == "" {
 		endpoint = defaultEndpoint
 	}
+	systemPrompt := strings.TrimSpace(os.Getenv("KLAUS_SYSTEM_PROMPT"))
+	if systemPrompt == "" {
+		systemPrompt = defaultSystemPrompt
+	}
 
 	if discordToken == "" {
 		log.Fatal("Environment variable KLAUS_DISCORD_BOT_TOKEN is missing!")
@@ -123,9 +140,10 @@ func main() {
 
 	// Initialize Pollinations client
 	aiClient := &pollinationsClient{
-		apiKey:   pollinationsAPIKey,
-		endpoint: endpoint,
-		model:    modelName,
+		apiKey:       pollinationsAPIKey,
+		endpoint:     endpoint,
+		model:        modelName,
+		systemPrompt: systemPrompt,
 		httpClient: &http.Client{
 			Timeout: 60 * time.Second,
 		},
@@ -181,7 +199,7 @@ func handleMessage(
 
 	// Remove ping from the message
 	prompt := stripBotMention(m.Content, botID)
-	if prompt == "" {
+	if prompt == "" && m.ReferencedMessage == nil {
 		_, _ = s.ChannelMessageSendReply(m.ChannelID, "was", m.Reference())
 		return
 	}
@@ -189,8 +207,10 @@ func handleMessage(
 	// Show "Klaus is typing..." while thinking
 	_ = s.ChannelTyping(m.ChannelID)
 
+	history := buildChatHistory(s, m, botID, prompt)
+
 	// Send request to Pollinations API
-	respText, err := aiClient.generateReply(ctx, prompt)
+	respText, err := aiClient.generateReply(ctx, history)
 	if err != nil {
 		log.Printf("Pollinations-Fehler: %v", err)
 		_, _ = s.ChannelMessageSendReply(m.ChannelID, "kein plan", m.Reference())
@@ -215,6 +235,52 @@ func handleMessage(
 			return
 		}
 	}
+}
+
+func buildChatHistory(s *discordgo.Session, m *discordgo.MessageCreate, botID, currentPrompt string) []chatMessage {
+	var history []chatMessage
+
+	// Fetch recent channel messages before the current one for conversational context
+	recentMsgs, err := s.ChannelMessages(m.ChannelID, contextMessageCount, m.ID, "", "")
+	if err == nil && len(recentMsgs) > 0 {
+		// ChannelMessages returns newest first; iterate in reverse for chronological order
+		for i := len(recentMsgs) - 1; i >= 0; i-- {
+			msg := recentMsgs[i]
+			text := stripBotMention(msg.Content, botID)
+			if text == "" || msg.Author == nil {
+				continue
+			}
+			if msg.Author.ID == botID {
+				history = append(history, chatMessage{
+					Role:    "assistant",
+					Content: text,
+				})
+			} else {
+				history = append(history, chatMessage{
+					Role:    "user",
+					Content: fmt.Sprintf("%s: %s", msg.Author.Username, text),
+				})
+			}
+		}
+	} else if m.ReferencedMessage != nil && m.ReferencedMessage.Author != nil {
+		refText := stripBotMention(m.ReferencedMessage.Content, botID)
+		if refText != "" {
+			history = append(history, chatMessage{
+				Role:    "user",
+				Content: fmt.Sprintf("%s: %s", m.ReferencedMessage.Author.Username, refText),
+			})
+		}
+	}
+
+	if currentPrompt == "" {
+		currentPrompt = "(refers to the previous message)"
+	}
+	history = append(history, chatMessage{
+		Role:    "user",
+		Content: fmt.Sprintf("%s: %s", m.Author.Username, currentPrompt),
+	})
+
+	return history
 }
 
 func isBotMentioned(m *discordgo.MessageCreate, botID string) bool {
