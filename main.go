@@ -22,6 +22,8 @@ const (
 	defaultEndpoint     = "https://text.pollinations.ai/openai"
 	discordMaxMsgLen    = 2000
 	contextMessageCount = 10
+	rateLimitInterval   = 30 * time.Second
+	queueBufferSize     = 100
 	defaultSystemPrompt = "You are Klaus, a regular user on this Discord server and not a formal AI assistant. " +
 		"Keep your replies extremely short, dry, and casual in a typical Discord chat style (usually just a few words or at most 1-2 short sentences, lowercase is fine). " +
 		"Never write long paragraphs, bulleted lists, or generic AI filler phrases. " +
@@ -34,6 +36,7 @@ type pollinationsClient struct {
 	model        string
 	systemPrompt string
 	httpClient   *http.Client
+	lastRequest  time.Time
 }
 
 type chatCompletionRequest struct {
@@ -160,9 +163,12 @@ func main() {
 		discordgo.IntentsDirectMessages |
 		discordgo.IntentsMessageContent
 
+	msgQueue := make(chan *discordgo.MessageCreate, queueBufferSize)
+	go processQueue(ctx, dg, aiClient, msgQueue)
+
 	// Event handler for triggering with every new message
 	dg.AddHandler(func(s *discordgo.Session, m *discordgo.MessageCreate) {
-		handleMessage(ctx, s, m, aiClient)
+		enqueueMessage(s, m, msgQueue)
 	})
 
 	// Open websocket to discord
@@ -181,11 +187,10 @@ func main() {
 	fmt.Println("\nKlaus is shutting down...")
 }
 
-func handleMessage(
-	ctx context.Context,
+func enqueueMessage(
 	s *discordgo.Session,
 	m *discordgo.MessageCreate,
-	aiClient *pollinationsClient,
+	msgQueue chan<- *discordgo.MessageCreate,
 ) {
 	// Ignore own messages
 	if s.State.User == nil || m.Author.ID == s.State.User.ID {
@@ -204,13 +209,56 @@ func handleMessage(
 		return
 	}
 
+	select {
+	case msgQueue <- m:
+	default:
+		log.Printf("Queue is full, dropping message %s", m.ID)
+	}
+}
+
+func processQueue(
+	ctx context.Context,
+	s *discordgo.Session,
+	aiClient *pollinationsClient,
+	msgQueue <-chan *discordgo.MessageCreate,
+) {
+	for m := range msgQueue {
+		if !aiClient.lastRequest.IsZero() {
+			elapsed := time.Since(aiClient.lastRequest)
+			if elapsed < rateLimitInterval {
+				wait := rateLimitInterval - elapsed
+				log.Printf("Rate-Limit Queue: warte %v vor Antwort auf %s...", wait.Round(time.Second), m.Author.Username)
+				time.Sleep(wait)
+			}
+		}
+
+		handleQueuedMessage(ctx, s, m, aiClient)
+		aiClient.lastRequest = time.Now()
+	}
+}
+
+func handleQueuedMessage(
+	ctx context.Context,
+	s *discordgo.Session,
+	m *discordgo.MessageCreate,
+	aiClient *pollinationsClient,
+) {
+	botID := s.State.User.ID
+	prompt := stripBotMention(m.Content, botID)
+
 	// Show "Klaus is typing..." while thinking
 	_ = s.ChannelTyping(m.ChannelID)
 
 	history := buildChatHistory(s, m, botID, prompt)
 
-	// Send request to Pollinations API
+	// Send request to Pollinations API (with 1 automatic retry if HTTP 429 occurs)
 	respText, err := aiClient.generateReply(ctx, history)
+	if err != nil && strings.Contains(err.Error(), "HTTP 429") {
+		log.Printf("Pollinations 429 erhalten, warte %v und versuche erneut...", rateLimitInterval)
+		time.Sleep(rateLimitInterval)
+		_ = s.ChannelTyping(m.ChannelID)
+		respText, err = aiClient.generateReply(ctx, history)
+	}
 	if err != nil {
 		log.Printf("Pollinations-Fehler: %v", err)
 		_, _ = s.ChannelMessageSendReply(m.ChannelID, "kein plan", m.Reference())
