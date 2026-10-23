@@ -288,9 +288,10 @@ func handleQueuedMessage(
 func buildChatHistory(s *discordgo.Session, m *discordgo.MessageCreate, botID, currentPrompt string) []chatMessage {
 	var history []chatMessage
 
-	// Fetch recent channel messages before the current one for conversational context
+	// Fetch recent channel messages before the current one as background context only
 	recentMsgs, err := s.ChannelMessages(m.ChannelID, contextMessageCount, m.ID, "", "")
 	if err == nil && len(recentMsgs) > 0 {
+		var transcriptLines []string
 		// ChannelMessages returns newest first; iterate in reverse for chronological order
 		for i := len(recentMsgs) - 1; i >= 0; i-- {
 			msg := recentMsgs[i]
@@ -298,34 +299,36 @@ func buildChatHistory(s *discordgo.Session, m *discordgo.MessageCreate, botID, c
 			if text == "" || msg.Author == nil {
 				continue
 			}
+			authorName := msg.Author.Username
 			if msg.Author.ID == botID {
-				history = append(history, chatMessage{
-					Role:    "assistant",
-					Content: text,
-				})
-			} else {
-				history = append(history, chatMessage{
-					Role:    "user",
-					Content: fmt.Sprintf("%s: %s", msg.Author.Username, text),
-				})
+				authorName = "Klaus (you)"
 			}
+			transcriptLines = append(transcriptLines, fmt.Sprintf("%s: %s", authorName, text))
 		}
-	} else if m.ReferencedMessage != nil && m.ReferencedMessage.Author != nil {
-		refText := stripBotMention(m.ReferencedMessage.Content, botID)
-		if refText != "" {
+		if len(transcriptLines) > 0 {
 			history = append(history, chatMessage{
-				Role:    "user",
-				Content: fmt.Sprintf("%s: %s", m.ReferencedMessage.Author.Username, refText),
+				Role: "system",
+				Content: "Recent channel chat log for background context only (do NOT answer old questions from this log; only respond to the user message that follows):\n" +
+					strings.Join(transcriptLines, "\n"),
 			})
 		}
 	}
 
 	if currentPrompt == "" {
-		currentPrompt = "(refers to the previous message)"
+		currentPrompt = "(refers to the previous/referenced message)"
 	}
+
+	userContent := fmt.Sprintf("%s: %s", m.Author.Username, currentPrompt)
+	if m.ReferencedMessage != nil && m.ReferencedMessage.Author != nil {
+		refText := stripBotMention(m.ReferencedMessage.Content, botID)
+		if refText != "" {
+			userContent = fmt.Sprintf("[Replying to %s: %q]\n%s", m.ReferencedMessage.Author.Username, refText, userContent)
+		}
+	}
+
 	history = append(history, chatMessage{
 		Role:    "user",
-		Content: fmt.Sprintf("%s: %s", m.Author.Username, currentPrompt),
+		Content: userContent,
 	})
 
 	return history
