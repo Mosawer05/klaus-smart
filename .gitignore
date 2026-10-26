@@ -1,1 +1,12 @@
 klaus
+klaus-smart.exe
+start.bat
+bench-ergebnis.txt
+klaus.log
+klaus.log.alt
+memory.json
+reminders.json
+yt-dlp.exe
+*.tmp
+start.bat.*
+*.bak
